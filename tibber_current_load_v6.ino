@@ -1,7 +1,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
-#include <secrets.h>  // bevat WIFI_SSID, WIFI_PASS, TIBBER_TOKEN, TIBBER_HOME_ID
+#include <secrets-empty.h>  // bevat WIFI_SSID, WIFI_PASS, TIBBER_TOKEN, TIBBER_HOME_ID
 
 const char* host = "websocket-api.tibber.com";
 const int port = 443;
