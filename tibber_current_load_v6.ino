@@ -1,7 +1,9 @@
+#include <TFT_eSPI.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
-#include <secrets-empty.h>  // bevat WIFI_SSID, WIFI_PASS, TIBBER_TOKEN, TIBBER_HOME_ID
+#include <secrets.h>  // bevat WIFI_SSID, WIFI_PASS, TIBBER_TOKEN, TIBBER_HOME_ID
 
 const char* host = "websocket-api.tibber.com";
 const int port = 443;
@@ -11,6 +13,7 @@ const char* path = "/v1-beta/gql/subscriptions";
 const char* root_ca = TIBBER_ROOT_CA;
 
 WiFiClientSecure client;
+TFT_eSPI tft = TFT_eSPI(135, 240);  // Invoke custom library
 
 void setup() {
   Serial.begin(9600);
@@ -25,6 +28,7 @@ void setup() {
   Serial.println("\nWiFi connected!");
 
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  initTft();
 
   IPAddress ip;
   if (!WiFi.hostByName(host, ip)) {
@@ -34,8 +38,16 @@ void setup() {
   Serial.print("Resolved IP: ");
   Serial.println(ip);
 
+  connectWebSocket();
+
+  Serial.println("WebSocket connected");
+  delay(500);
+}
+
+void connectWebSocket() {
   //client.setDebugLevel(2);
   client.setCACert(root_ca);
+  client.setTimeout(120000);  // 2 minuten
 
   if (!client.connect(host, port)) {
     Serial.println("Connection failed!");
@@ -65,20 +77,12 @@ void setup() {
     Serial.println(line);
   }
   sendGraphQLInit();
-
-  Serial.println("WebSocket connected");
-  delay(500);
 }
 
-bool subscriptionStarted = false;
-unsigned long lastPing = 0;
+unsigned long lastDataTime = 0;
+const unsigned long timeoutInterval = 15000;
 
 void loop() {
-  if (millis() - lastPing > 10000) {
-    sendPing();
-    lastPing = millis();
-  }
-
   if (client.available()) {
     String payload = readWebSocketFrame();  // zie decoder hieronder
 
@@ -86,7 +90,7 @@ void loop() {
       Serial.println("Ontvangen payload:");
       Serial.println(payload);
 
-      DynamicJsonDocument doc(1024);
+      DynamicJsonDocument doc(2048);
       DeserializationError error = deserializeJson(doc, payload);
       if (error) {
         Serial.println("JSON parse error");
@@ -96,31 +100,42 @@ void loop() {
       const char* type = doc["type"];
       if (strcmp(type, "connection_ack") == 0) {
         Serial.println("✅ Connection acknowledged door server");
-
-        if (!subscriptionStarted) {
-          sendGraphQLStart();
-          subscriptionStarted = true;
-        }
+        sendGraphQLStart();
+      } else if (strcmp(type, "ka") == 0) {
+        Serial.println("🔄 Keepalive ontvangen");
       } else if (strcmp(type, "next") == 0) {
-        Serial.println("📦 Nieuwe meetdata ontvangen:");
+        lastDataTime = millis();
+        GetCurrentPower(doc["payload"]);
+        //sendPing();
+        //Serial.println("📦 Nieuwe meetdata ontvangen:");
+        //serializeJsonPretty(doc["payload"], Serial);
+      } else if (strcmp(type, "pong") == 0) {
+        Serial.println(" pong recieved:");
         serializeJsonPretty(doc["payload"], Serial);
       } else if (strcmp(type, "error") == 0) {
         Serial.println("❌ Fout ontvangen:");
         serializeJsonPretty(doc, Serial);
-      }
-      else
-      {
+      } else {
         Serial.print("ander type:");
         Serial.println(type);
         serializeJsonPretty(doc, Serial);
       }
     }
-  }
-  if (millis() - lastPing > 10000) {
-    sendPing();
-    lastPing = millis();
+  } else if (millis() - lastDataTime > timeoutInterval) {
+    Serial.println("⏳ Geen data ontvangen, herstart verbinding...");
+    client.stop();
+    delay(1000);
+    connectWebSocket();       // reconnect and resubscribe
+    lastDataTime = millis();  // reset timer
+  } else if (!client.connected()) {
+    Serial.println("🔌 Verbinding verloren, herstart...");
+    client.stop();
+    delay(500);
+    lastDataTime = millis();
+    connectWebSocket();  // jouw herstartfunctie
   }
 }
+
 
 
 String readWebSocketFrame() {
@@ -128,6 +143,26 @@ String readWebSocketFrame() {
 
   uint8_t b1 = client.read();
   uint8_t b2 = client.read();
+
+  bool fin = b1 & 0x80;
+  uint8_t opcode = b1 & 0x0F;
+
+  if (!fin) {
+    Serial.println("⚠️ Gefragmenteerd frame ontvangen, niet ondersteund");
+    return "";
+  }
+
+  if (opcode == 0x9) {  // ping
+    Serial.println("📥 Ping ontvangen");
+    sendPong();
+    return "";
+  }
+
+  if (opcode != 0x1) {
+    Serial.print("⚠️ Niet-tekstframe ontvangen, opcode: ");
+    Serial.println(opcode);
+    return "";
+  }
 
   bool masked = b2 & 0x80;
   uint64_t payloadLength = b2 & 0x7F;
@@ -141,20 +176,35 @@ String readWebSocketFrame() {
     }
   }
 
+  if (payloadLength > 8192) {
+    Serial.println("⚠️ Payload te groot, frame genegeerd");
+    return "";
+  }
+
   uint8_t mask[4] = { 0, 0, 0, 0 };
   if (masked) {
-    for (int i = 0; i < 4; i++) mask[i] = client.read();
+    for (int i = 0; i < 4; i++) {
+      if (!client.available()) return "";
+      mask[i] = client.read();
+    }
   }
 
   String payload = "";
   for (uint64_t i = 0; i < payloadLength; i++) {
+    while (!client.available()) delay(1);
     char c = client.read();
     if (masked) c ^= mask[i % 4];
     payload += c;
   }
 
+  Serial.print("📦 Frame ontvangen: opcode=");
+  Serial.print(opcode);
+  Serial.print(", length=");
+  Serial.println(payloadLength);
+
   return payload;
 }
+
 
 
 void sendWebSocketFrame(String payload) {
@@ -218,7 +268,7 @@ void sendGraphQLStart() {
   doc["type"] = "subscribe";
 
   JsonObject payload = doc.createNestedObject("payload");
-  payload["query"] = String("subscription{liveMeasurement(homeId:\"") + TIBBER_HOME_ID + "\"){power}}";
+  payload["query"] = String("subscription{liveMeasurement(homeId:\"") + TIBBER_HOME_ID + "\"){power timestamp}}";
 
   String msg;
   serializeJson(doc, msg);
@@ -228,8 +278,6 @@ void sendGraphQLStart() {
   serializeJson(doc, jsonString);
 
   Serial.println("Versturen abonnement: " + jsonString);
-
-  Serial.println("Sent subscription start");
 }
 
 String generateWebSocketKey() {
@@ -257,8 +305,66 @@ String generateWebSocketKey() {
   return key.substring(0, 24);  // WebSocket spec vereist 24 tekens
 }
 
-void sendPing() {
-  uint8_t pingFrame[2] = {0x89, 0x00};  // opcode 0x9 (ping), no payload
-  client.write(pingFrame, 2);
-  Serial.println("Sent ping");
+// void sendPong() {
+//   DynamicJsonDocument doc(256);
+//   doc["type"] = "pong";
+//   doc["payload"] = JsonObject();  // must be present
+
+//   String msg;
+//   serializeJson(doc, msg);
+//   sendWebSocketFrame(msg);
+//   Serial.println("📤 Pong verzonden");
+// }
+
+void sendPong() {
+  uint8_t pongFrame[2] = { 0x8A, 0x00 };  // FIN + pong opcode, geen payload
+  client.write(pongFrame, 2);
+  Serial.println("📤 Pong verzonden");
+}
+
+void GetCurrentPower(String payload) {
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.println("JSON parse error");
+    return;
+  }
+
+  int power = doc["data"]["liveMeasurement"]["power"];
+  Serial.print("🔌 Vermogen: ");
+  Serial.println(power);
+  writePower(String(power));
+}
+
+void writePower(String power) {
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextSize(2);
+  tft.drawString(currentTime(), tft.width() / 2, tft.height() / 4);
+  String data = "Power:" + power;
+  tft.drawString(data, tft.width() / 2, tft.height() / 2);
+}
+
+void initTft() {
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN);
+  tft.setCursor(0, 0);
+  tft.setTextDatum(MC_DATUM);
+}
+
+String currentTime()
+{
+time_t now = time(nullptr);
+struct tm* timeinfo = localtime(&now);
+
+char timeString[30];
+strftime(timeString, sizeof(timeString), "%Y-%m-%d %H:%M:%S", timeinfo);
+
+Serial.print("🕒 Huidige tijd: ");
+Serial.println(timeString);
+return timeString;
 }
